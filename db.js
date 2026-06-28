@@ -17,7 +17,7 @@
 
 const { Pool } = require('pg');
 
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://_920f994124055248:_44fcf46755715bfecbf6ae6c6b86ca@primary.esa-count-rss--y8slbvbfd25z.addon.code.run:5432/_4d2f49ccf797?sslmode=require';
+const DATABASE_URL = process.env.DATABASE_URL || '';
 let pool = null;
 let ready = false;
 

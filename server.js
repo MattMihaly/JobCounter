@@ -32,7 +32,23 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const db = require('./db');
+
+// Load the DB module defensively. If it (or its 'pg' dependency) fails to load
+// for any reason, fall back to a no-op so the counter/website still run. The
+// database must never be able to take down the site.
+let db;
+try {
+  db = require('./db');
+} catch (e) {
+  console.error('DB module unavailable, archiving disabled:', e.message);
+  db = {
+    init: async () => false,
+    isReady: () => false,
+    recordBatch: async () => {},
+    markCleared: async () => {},
+    stats: async () => ({ enabled: false, error: 'db module not loaded' }),
+  };
+}
 
 const FEED_URL = 'http://esa.act.gov.au/feeds/currentincidents.xml';
 const POLL_INTERVAL_MS = 60 * 1000;        // match the feed's 60s cadence
@@ -433,23 +449,32 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </html>`;
 
 /* ---------- boot ---------- */
-loadState();
-// Initialise the database (optional). We don't await — if it connects, the
-// next poll picks it up; if it doesn't, the counter runs regardless.
-db.init().then((ok) => {
-  if (ok) console.log('Archiving live incidents to PostgreSQL.');
-});
-poll();
-setInterval(poll, POLL_INTERVAL_MS);
+// Guard rails: never let an unexpected async error (e.g. from the database)
+// crash the process and take the website down with it.
+process.on('unhandledRejection', (e) =>
+  console.error('Unhandled rejection (ignored):', e && e.message));
+process.on('uncaughtException', (e) =>
+  console.error('Uncaught exception (ignored):', e && e.message));
 
 server.on('error', (err) => {
   console.error('Server failed to start:', err.message);
   process.exit(1);
 });
+
+// 1) Bind the port FIRST so the platform's health check and routing succeed
+//    immediately, regardless of database or feed state.
 server.listen(PORT, HOST, () => {
   console.log('\n  ============================================');
   console.log('   ESA 24h incident tally is running');
   console.log(`   Listening on ${HOST}:${PORT}`);
-  console.log('   Routes: /   /api/tally   /healthz');
+  console.log('   Routes: /   /counter   /api/tally   /api/stats   /healthz');
   console.log('  ============================================\n');
+
+  // 2) Then do everything that could fail, after we're already listening.
+  loadState();
+  db.init()
+    .then((ok) => { if (ok) console.log('Archiving live incidents to PostgreSQL.'); })
+    .catch((e) => console.error('db.init error (archiving off):', e && e.message));
+  poll();
+  setInterval(poll, POLL_INTERVAL_MS);
 });

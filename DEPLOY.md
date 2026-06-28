@@ -252,6 +252,15 @@ GROUP BY month ORDER BY month;
   The `/data` volume isn't mounted (or the mount path isn't exactly
   `/data`). Re-check Step 5.
 
+- **"upstream connect error… connection refused" right after deploy.**
+  The container is running but nothing is listening on the port — the app
+  crashed on startup. The usual cause is a stale Docker build cache that
+  skipped installing `pg` after it was added. Fix: in Northflank, trigger a
+  **rebuild without cache** (or push any commit to bust the cache). The
+  Dockerfile now verifies `pg` at build time, so a broken install fails the
+  build loudly instead of shipping a crashing image; and the app is now
+  hardened to bind the port even if the database module can't load at all.
+
 - **`/healthz` shows `"archiving":false`.**
   The database isn't connected. Check that `DATABASE_URL` is set on the
   service (Step 5b) and points at the Postgres addon, and that the addon is

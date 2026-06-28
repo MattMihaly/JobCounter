@@ -18,10 +18,12 @@ ENV PORT=3000
 ENV STATE_DIR=/data
 RUN mkdir -p /data
 
-# Install dependencies first (better layer caching). Only package.json is
-# needed; there's no lockfile, so use npm install.
+# Install dependencies. Copy only package.json first for layer caching, then
+# install. We verify 'pg' actually landed so a broken/cached install fails the
+# BUILD loudly instead of silently shipping an image that can't archive.
 COPY package.json ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev --no-audit --no-fund \
+ && node -e "require('pg'); console.log('pg installed OK')"
 
 COPY server.js ./
 COPY db.js ./

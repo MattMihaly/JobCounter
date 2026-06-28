@@ -1,0 +1,24 @@
+# Render deploy blueprint.
+# In the Render dashboard: New + → Blueprint → point at this repo.
+#
+# IMPORTANT: the free plan SLEEPS after ~15 min idle, which stops the
+# 60-second poller and freezes the 24h tally. For a genuinely unattended
+# count, use the "starter" plan below (≈US$7/mo) which never sleeps.
+# If you must stay free, change plan to "free" and run an external uptime
+# pinger against /healthz every ~10 min to keep it awake (imperfect).
+
+services:
+  - type: web
+    name: esa-incident-tally
+    runtime: node
+    plan: starter            # never sleeps. Use "free" only with a keep-alive pinger.
+    buildCommand: ""         # no build step; plain Node, no dependencies
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: STATE_DIR
+        value: /var/data     # persistent disk mount, so the tally survives restarts
+    disk:
+      name: esa-state
+      mountPath: /var/data
+      sizeGB: 1

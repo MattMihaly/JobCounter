@@ -1,0 +1,14 @@
+{
+  "name": "esa-act-incident-tally",
+  "version": "2.0.0",
+  "description": "Rolling 24h tally of ACT ESA ambulance and fire incidents from the official GeoRSS feed.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "CC-BY-4.0",
+  "private": true
+}

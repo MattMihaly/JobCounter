@@ -3,8 +3,6 @@
 # Build option in Northflank MUST be set to "Dockerfile" (not Buildpack).
 # This pins the port so the platform's routed port and the app's listening
 # port always match — a mismatch is what produces "Not found" on every path.
-#
-# The app has no npm dependencies, so there is no install step.
 
 FROM node:20-alpine
 
@@ -14,14 +12,20 @@ WORKDIR /usr/src/app
 # so Northflank auto-detects and routes to it.
 ENV PORT=3000
 
-# Persistent-volume mount point. Mount a Northflank volume here so the rolling
-# 24h tally survives redeploys. Without a volume the app still runs; the count
-# just resets on each redeploy.
+# Persistent-volume mount point for the file-backed 24h tally + busiest-day
+# record. (Incident history goes to PostgreSQL via DATABASE_URL, set as a
+# Northflank secret/env var — see DEPLOY.md.)
 ENV STATE_DIR=/data
 RUN mkdir -p /data
 
+# Install dependencies first (better layer caching). Only package.json is
+# needed; there's no lockfile, so use npm install.
 COPY package.json ./
+RUN npm install --omit=dev
+
 COPY server.js ./
+COPY db.js ./
+COPY public ./public
 
 EXPOSE 3000
 

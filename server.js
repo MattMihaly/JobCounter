@@ -32,6 +32,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const db = require('./db');
 
 const FEED_URL = 'http://esa.act.gov.au/feeds/currentincidents.xml';
 const POLL_INTERVAL_MS = 60 * 1000;        // match the feed's 60s cadence
@@ -50,20 +51,47 @@ let seen = new Map();
 let lastPoll = null;
 let lastError = null;
 
+/**
+ * dailyTotals: { [yyyy-mm-dd]: { ambulance, fire, other } }
+ * Each NEW incident (first time its cadid is seen) increments the counter for
+ * the Canberra calendar date on which it was first seen. This is a permanent
+ * running history (not pruned), so the busiest day is the max across it.
+ */
+let dailyTotals = {};
+
+/* Canberra-local YYYY-MM-DD for a given epoch ms, handling AEST/AEDT. */
+function canberraDateKey(ms = Date.now()) {
+  // en-CA gives ISO-style YYYY-MM-DD; timeZone handles daylight saving.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Australia/Sydney',  // ACT observes the same zone as NSW
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(ms));
+}
+
+function bucketOf(agency) {
+  const a = (agency || '').toLowerCase();
+  if (a.includes('ambulance')) return 'ambulance';
+  if (a.includes('fire')) return 'fire';
+  return 'other';
+}
+
 /* ---------- persistence (best-effort) ---------- */
 function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     seen = new Map(raw.seen);
     lastPoll = raw.lastPoll || null;
-    console.log(`Loaded ${seen.size} incidents from saved state.`);
+    dailyTotals = raw.dailyTotals || {};
+    console.log(`Loaded ${seen.size} incidents and ${Object.keys(dailyTotals).length} day(s) of history.`);
   } catch {
     console.log('No prior state; starting fresh.');
   }
 }
 function saveState() {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ seen: [...seen], lastPoll }));
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      seen: [...seen], lastPoll, dailyTotals,
+    }));
   } catch (e) {
     console.error('Could not save state:', e.message);
   }
@@ -93,6 +121,14 @@ function fetchFeed(url) {
 }
 
 /* ---------- parse the flat GeoRSS feed ---------- */
+/* Parse an ESA date like "01 May 2013 06:51:26" (Canberra local) to an ISO
+ * string. Returns null if absent/unparseable. */
+function parseEsaDate(s) {
+  if (!s) return null;
+  const d = new Date(s + ' GMT+1000'); // ESA timestamps are ACT local
+  return isNaN(d) ? null : d.toISOString();
+}
+
 function parseItems(xml) {
   const items = [];
   const itemRe = /<item>([\s\S]*?)<\/item>/g;
@@ -106,7 +142,42 @@ function parseItems(xml) {
     };
     const cadid = pick('cadid') || pick('guid');
     if (!cadid) continue;
-    items.push({ cadid, type: pick('type'), agency: pick('agency') });
+
+    // Fields appear both as their own tags and inside <description>. Prefer the
+    // dedicated tag, fall back to parsing the description text.
+    const desc = pick('description');
+    const fromDesc = (label) => {
+      const r = new RegExp(label + ':\\s*(.*)', 'i');
+      const x = r.exec(desc);
+      return x ? x[1].replace(/&#xD;|\r/g, '').trim() : '';
+    };
+
+    // GeoRSS point: "<georss:point>-35.2 149.1</georss:point>" or geo:lat/long
+    let lat = null, lon = null;
+    const pt = /<georss:point>\s*([-\d.]+)\s+([-\d.]+)\s*<\/georss:point>/.exec(block);
+    if (pt) { lat = parseFloat(pt[1]); lon = parseFloat(pt[2]); }
+    else {
+      const la = /<geo:lat>\s*([-\d.]+)\s*<\/geo:lat>/.exec(block);
+      const lo = /<geo:long>\s*([-\d.]+)\s*<\/geo:long>/.exec(block);
+      if (la) lat = parseFloat(la[1]);
+      if (lo) lon = parseFloat(lo[1]);
+    }
+
+    const agency = pick('agency') || fromDesc('Agency');
+    items.push({
+      cadid,
+      title:    pick('title'),
+      type:     pick('type')   || fromDesc('Type'),
+      agency,
+      bucket:   bucketOf(agency),
+      suburb:   fromDesc('Suburb'),
+      location: fromDesc('Location'),
+      status:   fromDesc('Status'),
+      latitude:  lat,
+      longitude: lon,
+      timeOfCall: parseEsaDate(fromDesc('Time of Call')),
+      updated:    parseEsaDate(fromDesc('Updated')),
+    });
   }
   return items;
 }
@@ -121,22 +192,53 @@ async function poll() {
     const xml = await fetchFeed(FEED_URL);
     const items = parseItems(xml);
     const now = Date.now();
+    const nowIso = new Date(now).toISOString();
     let added = 0;
     for (const it of items) {
       if (!seen.has(it.cadid)) {
         seen.set(it.cadid, { agency: it.agency, type: it.type, firstSeen: now });
         added++;
+        // Record against the Canberra calendar day for the busiest-day history.
+        const day = canberraDateKey(now);
+        if (!dailyTotals[day]) dailyTotals[day] = { ambulance: 0, fire: 0, other: 0 };
+        dailyTotals[day][bucketOf(it.agency)]++;
       }
     }
     prune();
-    lastPoll = new Date().toISOString();
+    lastPoll = nowIso;
     lastError = null;
     saveState();
+
+    // Archive to Postgres (no-op if DB disabled/unreachable; never blocks counter).
+    if (db.isReady()) {
+      await db.recordBatch(items, nowIso);
+      await db.markCleared(items.map((i) => i.cadid), nowIso);
+    }
+
     console.log(`[${lastPoll}] ${items.length} live, +${added} new, ${seen.size} in window`);
   } catch (e) {
     lastError = e.message;
     console.error('Poll failed:', e.message);
   }
+}
+
+/* Find the busiest calendar day for a given bucket across all history.
+ * Excludes today, since today is still accumulating and isn't a final total. */
+function busiestDay(bucket) {
+  const today = canberraDateKey();
+  let best = null;
+  for (const [day, totals] of Object.entries(dailyTotals)) {
+    if (day === today) continue;          // don't crown an incomplete day
+    const n = totals[bucket] || 0;
+    if (n === 0) continue;
+    if (!best || n > best.count) best = { date: day, count: n };
+  }
+  if (!best) return null;
+  // Add a human weekday label in Canberra time, e.g. "Tuesday".
+  const weekday = new Intl.DateTimeFormat('en-AU', {
+    timeZone: 'Australia/Sydney', weekday: 'long',
+  }).format(new Date(best.date + 'T12:00:00Z'));
+  return { date: best.date, weekday, count: best.count };
 }
 
 function buildTally() {
@@ -154,6 +256,11 @@ function buildTally() {
     windowHours: 24, ambulance, fire, other,
     total: ambulance + fire + other,
     byType, lastPoll, lastError,
+    busiest: {
+      ambulance: busiestDay('ambulance'),
+      fire: busiestDay('fire'),
+    },
+    today: canberraDateKey(),
     generatedAt: new Date().toISOString(),
   };
 }
@@ -164,7 +271,9 @@ const server = http.createServer((req, res) => {
 
   if (url === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', lastPoll, tracked: seen.size }));
+    res.end(JSON.stringify({
+      status: 'ok', lastPoll, tracked: seen.size, archiving: db.isReady(),
+    }));
     return;
   }
   if (url === '/api/tally') {
@@ -175,9 +284,31 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(buildTally()));
     return;
   }
-  if (url === '/' || url === '/index.html') {
+  if (url === '/api/stats') {
+    db.stats().then((s) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify(s));
+    }).catch((e) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    });
+    return;
+  }
+  if (url === '/counter') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(DASHBOARD_HTML);
+    return;
+  }
+  if (url === '/' || url === '/index.html') {
+    // Serve the campaign page from public/index.html. If it's missing for any
+    // reason, fall back to the embedded counter dashboard so the site never 404s.
+    fs.readFile(path.join(__dirname, 'public', 'index.html'), (err, data) => {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(err ? DASHBOARD_HTML : data);
+    });
     return;
   }
   res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -215,6 +346,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .dot.stale { background:#d97706; } .dot.err { background:#dc2626; }
   .flash { animation:flash .9s ease; }
   @keyframes flash { 0% { color:#16a34a; } 100% { color:var(--ink); } }
+  .record { margin:8px 16px 4px; padding:16px 18px; background:#f7f9fc;
+    border:1px solid #e7ecf3; border-radius:12px; }
+  .record-title { font-size:12px; font-weight:700; letter-spacing:.04em;
+    text-transform:uppercase; color:var(--esa-blue); margin-bottom:10px; }
+  .record-row { display:flex; align-items:baseline; justify-content:space-between;
+    padding:4px 0; }
+  .record-svc { font-size:14px; color:var(--ink); }
+  .record-val { font-size:15px; font-weight:700; font-variant-numeric:tabular-nums;
+    color:var(--ink); }
+  .record-note { margin-top:10px; font-size:10px; color:var(--muted); line-height:1.45; }
 </style>
 </head>
 <body>
@@ -236,6 +377,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </div>
       <p class="label">fire responses (ACTF&amp;R / RFS)</p>
     </div>
+    <div class="record" id="record">
+      <div class="record-title">Busiest day on record</div>
+      <div class="record-row">
+        <span class="record-svc">🚑 Ambulance</span>
+        <span class="record-val" id="recAmb">—</span>
+      </div>
+      <div class="record-row">
+        <span class="record-svc">🚒 Fire</span>
+        <span class="record-val" id="recFire">—</span>
+      </div>
+      <div class="record-note" id="recNote"></div>
+    </div>
     <div class="footer">
       <span id="status"><span class="dot"></span>connecting…</span><br>
       Source: <a href="https://esa.act.gov.au/?fullmap=true" target="_blank" rel="noopener">ACT ESA incidents feed</a> (CC BY 4.0).
@@ -245,6 +398,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <script>
   let pAmb=null,pFire=null;
   function flash(el){el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}
+  function fmtRecord(r){
+    if(!r) return '—';
+    return r.count+' · '+r.weekday+' '+r.date;
+  }
   async function refresh(){
     const s=document.getElementById('status');
     try{
@@ -254,6 +411,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if(pAmb!==null&&d.ambulance!==pAmb)flash(amb);
       if(pFire!==null&&d.fire!==pFire)flash(fire);
       pAmb=d.ambulance; pFire=d.fire;
+      // busiest-day record
+      const b=d.busiest||{};
+      document.getElementById('recAmb').textContent=fmtRecord(b.ambulance);
+      document.getElementById('recFire').textContent=fmtRecord(b.fire);
+      const note=document.getElementById('recNote');
+      if(!b.ambulance&&!b.fire){
+        note.textContent='Record builds from full days observed since launch (today excluded while in progress).';
+      } else { note.textContent='Highest single-day total per service since launch. Today excluded until complete.'; }
       let cls='dot',txt='live';
       if(d.lastError){cls+=' err';txt='feed error — last good data';}
       else if(d.lastPoll){const age=(Date.now()-new Date(d.lastPoll))/1000;
@@ -269,6 +434,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 /* ---------- boot ---------- */
 loadState();
+// Initialise the database (optional). We don't await — if it connects, the
+// next poll picks it up; if it doesn't, the counter runs regardless.
+db.init().then((ok) => {
+  if (ok) console.log('Archiving live incidents to PostgreSQL.');
+});
 poll();
 setInterval(poll, POLL_INTERVAL_MS);
 

@@ -61,6 +61,69 @@ To keep it running unattended 24/7, use a process manager, e.g.:
 npx pm2 start server.js --name esa-tally
 ```
 
+## Deploying to an always-on host (true 24/7 tally)
+
+**GitHub Pages cannot run this** — Pages serves static files only and never
+runs Node, so there's no process to poll the feed when no browser is open.
+You need a host that runs a Node process continuously.
+
+The catch in 2026: most "free" tiers **sleep after ~15 minutes idle**, and a
+sleeping process stops polling — which freezes the 24h tally. So:
+
+- **Best (≈US$7/mo): Render Starter or Railway Hobby.** Never sleeps, just
+  runs. A `render.yaml` blueprint is included — in Render, choose
+  *New + → Blueprint* and point it at your repo. It provisions a persistent
+  disk (`/var/data`) so the rolling window survives restarts.
+- **Free but doesn't sleep: Northflank's free tier** is the one mainstream
+  free option without forced sleep. See the step-by-step below.
+
+### Deploying to Northflank (free, no sleep)
+
+A `Dockerfile` is included specifically to make this deploy cleanly on
+Northflank. Using the Dockerfile (rather than buildpack auto-detection)
+removes the most common cause of failed deploys: a mismatch between the
+port the platform routes to and the port the app actually listens on. The
+Dockerfile pins both to **3000**.
+
+Steps:
+
+1. Push this folder to a GitHub repo.
+2. In Northflank: **Create new → Service → Combined service** (build +
+   deploy from the same repo).
+3. Connect your GitHub repo and pick the branch.
+4. Under **Build options**, choose **Dockerfile** (not Buildpack). Leave the
+   Dockerfile path as `/Dockerfile`.
+5. Under **Networking / Ports**, Northflank should auto-detect **port 3000**
+   from the Dockerfile's `EXPOSE 3000` and mark it **public** (HTTP). If it
+   doesn't, add a public HTTP port `3000` manually.
+6. **(For the persistent 24h tally)** Under **Advanced → Volumes**, add a
+   persistent volume mounted at **`/data`**. The Dockerfile already sets
+   `STATE_DIR=/data`, so the rolling window survives redeploys. Skip this
+   and the tally simply resets on each redeploy (it still works otherwise).
+7. Deploy. Northflank builds the image and gives you a `*.code.run` HTTPS
+   URL in a couple of minutes. Open it; `/healthz` should return
+   `{"status":"ok"}`.
+
+If a deploy ever fails, the two things to check first are: build option is
+set to **Dockerfile**, and the **public port is 3000**. Those two cover the
+overwhelming majority of Node deploy failures on any container host.
+- **Free with a workaround: Render Free** ($0) sleeps after 15 min. Change
+  `plan: starter` to `plan: free` in `render.yaml`, then run an external
+  uptime pinger (e.g. UptimeRobot) hitting `/healthz` every ~10 min to keep
+  it awake. Functional but fragile, and a gap during sleep loses incidents.
+
+All of these read `process.env.PORT` automatically (the server already
+honours it) and the `/healthz` endpoint is provided for platform health
+checks.
+
+### Persistence note
+
+On hosts with **ephemeral disks** (most free tiers), the local `state.json`
+is wiped on every redeploy, so a deploy resets the tally. Set the
+`STATE_DIR` env var to a mounted persistent disk to avoid this (the included
+`render.yaml` does this for you). Without a persistent disk the tally still
+survives ordinary restarts on most platforms, just not redeploys.
+
 ## API
 
 `GET /api/tally` returns:

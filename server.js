@@ -23,7 +23,12 @@ const FEED_URL = 'http://esa.act.gov.au/feeds/currentincidents.xml';
 const POLL_INTERVAL_MS = 60 * 1000;        // feed updates every 60s
 const WINDOW_MS = 24 * 60 * 60 * 1000;     // rolling 24 hours
 const PORT = process.env.PORT || 3000;
-const STATE_FILE = path.join(__dirname, 'state.json');
+// STATE_DIR lets you point at a mounted persistent disk on hosts where the
+// app's own filesystem is ephemeral (wiped on redeploy/restart). On Render,
+// set STATE_DIR to your disk mount path, e.g. /var/data. Falls back to the
+// app dir, which still survives plain restarts on most platforms.
+const STATE_DIR = process.env.STATE_DIR || __dirname;
+const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
 /**
  * seen: Map<cadid, { agency, type, firstSeen, timeOfCall, suburb, title }>
@@ -172,6 +177,11 @@ function buildTally() {
 
 // ---- HTTP server: static files + /api/tally ----
 const server = http.createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', lastPoll, tracked: seen.size }));
+    return;
+  }
   if (req.url === '/api/tally') {
     res.writeHead(200, {
       'Content-Type': 'application/json',
@@ -186,7 +196,20 @@ const server = http.createServer((req, res) => {
     res.writeHead(403); res.end('Forbidden'); return;
   }
   fs.readFile(full, (err, content) => {
-    if (err) { res.writeHead(404); res.end('Not found'); return; }
+    if (err) {
+      // If the dashboard file isn't present in the deployed container
+      // (e.g. the public/ folder didn't get included in the build), fall
+      // back to a minimal embedded page for the root so the site still
+      // works. The API still serves the real data either way.
+      if (req.url === '/' || req.url === '/index.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(FALLBACK_HTML);
+        return;
+      }
+      res.writeHead(404);
+      res.end('Not found: ' + file);
+      return;
+    }
     const ext = path.extname(full);
     const mime = { '.html': 'text/html', '.js': 'text/javascript',
                    '.css': 'text/css' }[ext] || 'application/octet-stream';
@@ -195,28 +218,66 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Minimal self-contained dashboard used only if public/index.html is absent.
+const FALLBACK_HTML = `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESA Incidents — 24h Tally</title>
+<style>
+ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+ background:#f4f6f9;color:#2b2b2b;display:flex;justify-content:center;padding:24px 12px}
+ .card{width:100%;max-width:460px;background:#fff;border-radius:14px;overflow:hidden;
+ box-shadow:0 8px 30px rgba(0,0,0,.08)}
+ .header{background:#2f5f96;color:#fff;padding:30px 24px;text-align:center}
+ .header h1{margin:0;font-size:26px;font-weight:800;line-height:1.15}
+ .row{display:flex;align-items:center;justify-content:center;gap:16px;padding:26px 0}
+ .count{font-size:54px;font-weight:800;min-width:84px;text-align:left;font-variant-numeric:tabular-nums}
+ .label{text-align:center;color:#6b7280;font-size:16px;margin:-14px 0 0}
+ .divider{height:1px;background:#eef0f3;margin:0 12px}
+ .ico{font-size:42px}
+ .footer{padding:16px 22px;text-align:center;font-size:11px;color:#6b7280}
+</style></head><body>
+<div class="card">
+ <div class="header"><h1>Emergency incidents<br>attended (last 24h)</h1></div>
+ <div class="row"><span class="ico">🚑</span><div class="count" id="amb">–</div></div>
+ <p class="label">ambulance responses (ACTAS)</p>
+ <div class="divider"></div>
+ <div class="row"><span class="ico">🚒</span><div class="count" id="fire">–</div></div>
+ <p class="label">fire responses (ACTF&amp;R / RFS)</p>
+ <div class="footer" id="status">loading…</div>
+</div>
+<script>
+async function r(){try{const d=await(await fetch('/api/tally',{cache:'no-store'})).json();
+amb.textContent=d.ambulance;fire.textContent=d.fire;
+const t=d.lastPoll?new Date(d.lastPoll).toLocaleTimeString():'—';
+status.textContent=(d.lastError?'feed error':'live')+' · updated '+t+' · '+d.total+' total';
+}catch(e){status.textContent='cannot reach server';}}
+r();setInterval(r,15000);
+</script></body></html>`;
+
 loadState();
 poll();                              // poll immediately on boot
 setInterval(poll, POLL_INTERVAL_MS); // then every 60s
 
-// Start listening, automatically trying the next port if one is in use.
-function start(port, attemptsLeft = 10) {
-  server.once('error', (err) => {
-    if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
-      console.warn(`Port ${port} in use, trying ${port + 1}…`);
-      start(port + 1, attemptsLeft - 1);
-    } else {
-      console.error('Server failed to start:', err.message);
-      process.exit(1);
-    }
-  });
-  server.listen(port, () => {
-    const url = `http://localhost:${port}`;
-    console.log('\n  ============================================');
-    console.log('   ESA 24h incident tally is running');
-    console.log(`   Open:  ${url}`);
-    console.log('   Stop:  press Ctrl+C in this terminal');
-    console.log('  ============================================\n');
-  });
-}
-start(Number(PORT));
+// Bind to 0.0.0.0 so the app is reachable from outside the container
+// (hosts like Northflank route external traffic to the container's public
+// interface, not localhost). We listen on EXACTLY process.env.PORT — in a
+// hosted container the platform routes to that specific port, so if it's
+// taken we must fail loudly rather than silently moving to another port
+// (which would leave the platform routing to a port nothing is on, i.e.
+// "Not found" on every path).
+const HOST = '0.0.0.0';
+
+server.on('error', (err) => {
+  console.error('Server failed to start:', err.message);
+  process.exit(1);
+});
+
+server.listen(Number(PORT), HOST, () => {
+  const addr = server.address();
+  console.log('\n  ============================================');
+  console.log('   ESA 24h incident tally is running');
+  console.log(`   Listening on ${HOST}:${addr.port}`);
+  console.log(`   Local:  http://localhost:${addr.port}`);
+  console.log('   Health: /healthz   API: /api/tally');
+  console.log('  ============================================\n');
+});
